@@ -1,0 +1,153 @@
+name: Build Android APK
+
+# 三条通道（详见 .github/scripts/sync-gitee.sh 顶部说明）：
+#   1. push 代码            → 只编译；测试包进 Actions Artifacts，并同步到 Gitee 的 beta 分支
+#                             （App 不读 beta，所以其他用户完全无感）
+#   2. 手动 Run workflow    → 勾「正式发布」才会更新 Gitee 的 kcb.apk + version.json
+#                             （用户的「检查更新」只认 version.json，这一步才会影响用户）
+#   3. 版本号唯一来源是 android-app/VERSION，不再用 GITHUB_RUN_NUMBER
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android-app/**'
+      - '.github/**'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '正式发布到 Gitee（更新 kcb.apk + version.json，所有用户会收到更新提示）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 读取版本号（android-app/VERSION）
+        id: ver
+        run: |
+          node .github/scripts/version.js --check
+          echo "name=$(node .github/scripts/version.js --name)" >> "$GITHUB_OUTPUT"
+          echo "code=$(node .github/scripts/version.js --code)" >> "$GITHUB_OUTPUT"
+
+      - name: Create Android project (Capacitor)
+        working-directory: android-app
+        run: |
+          npm install --no-audit --no-fund
+          npx cap add android
+
+      - name: Patch app (name / icons / version)
+        run: bash .github/scripts/patch-android.sh
+
+      - name: Prepare signing keystore
+        env:
+          KCB_KEYSTORE_BASE64: ${{ secrets.KCB_KEYSTORE_BASE64 }}
+          KCB_KEYSTORE_PASSWORD: ${{ secrets.KCB_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$KCB_KEYSTORE_BASE64" ] && [ -n "$KCB_KEYSTORE_PASSWORD" ]; then
+            echo "使用正式签名密钥"
+            echo "$KCB_KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore.p12
+            keytool -list -keystore /tmp/release.keystore.p12 -storetype PKCS12 \
+              -storepass "$KCB_KEYSTORE_PASSWORD" -noprompt || true
+          else
+            echo "::warning::未配置签名密钥 Secret，改用调试签名（无法覆盖更新正式版）"
+            keytool -genkeypair -keystore /tmp/release.keystore.p12 -storetype PKCS12 \
+              -storepass android -alias kcbkey -keypass android \
+              -dname "CN=KCB Debug,O=dabai,C=CN" -keyalg RSA -keysize 2048 -validity 10950
+          fi
+
+      - name: Build release APK
+        working-directory: android-app/android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK
+        env:
+          KCB_KEYSTORE_PASSWORD: ${{ secrets.KCB_KEYSTORE_PASSWORD }}
+          APP_VERSION: ${{ steps.ver.outputs.name }}
+        run: |
+          set -euo pipefail
+          PASS="${KCB_KEYSTORE_PASSWORD:-android}"
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          UNSIGNED="android-app/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          ls -la "$(dirname "$UNSIGNED")"
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" kcb-aligned.apk
+          "$BT/apksigner" sign \
+            --ks /tmp/release.keystore.p12 --ks-type PKCS12 \
+            --ks-pass "pass:$PASS" \
+            --out "kcb-${APP_VERSION}.apk" kcb-aligned.apk
+          "$BT/apksigner" verify --print-certs "kcb-${APP_VERSION}.apk"
+          ls -la kcb-[0-9]*.apk
+
+      - name: Upload artifact（测试包，仅登录可见）
+        uses: actions/upload-artifact@v7
+        with:
+          name: kcb-apk-${{ steps.ver.outputs.name }}-run${{ github.run_number }}
+          path: kcb-[0-9]*.apk
+
+      # ── 测试通道：每次 push 都同步，用户无感 ──────────────────────────
+      - name: 同步测试版到 Gitee（kcb-beta.apk）
+        if: ${{ !inputs.publish }}
+        continue-on-error: true
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: bash .github/scripts/sync-gitee.sh beta
+
+      # ── 正式通道：只有手动 Run workflow 勾选才会执行 ──────────────────
+      - name: 正式发布到 Gitee（kcb.apk + version.json）
+        if: ${{ inputs.publish }}
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: bash .github/scripts/sync-gitee.sh publish
+
+      - name: 创建 GitHub Release（仅正式发布）
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: ${{ steps.ver.outputs.name }}
+        run: |
+          set -euo pipefail
+          TAG="v${APP_VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，跳过创建"
+          else
+            gh release create "$TAG" kcb-[0-9]*.apk \
+              --title "我的课表 Android v${APP_VERSION}" \
+              --notes "安徽建筑大学研究生课表 App v${APP_VERSION}
+
+          下载 kcb-${APP_VERSION}.apk 安装；首次安装需允许「未知来源应用」。
+          已装旧版的话，也可以直接在 App 内「设置 → 检查更新」升级，课表数据不会丢。
+
+          国内下载更快：[Gitee 直链](https://gitee.com/dabai214109/ahjzu-schedule/raw/master/kcb.apk)"
+          fi
+
+      - name: 本次结果
+        if: always()
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.name }}
+        run: |
+          echo "版本 v${APP_VERSION}"
+          echo "测试包：Gitee beta 分支 kcb-beta.apk（或本页 Artifacts）"
+          echo "正式发布：${{ inputs.publish }}"
+          echo "版本清单：${{ steps.ver.outputs.code }}"
